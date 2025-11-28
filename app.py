@@ -2,18 +2,54 @@ import streamlit as st
 import zipfile
 import json
 from io import BytesIO
-from zipfile import ZipFile
-from kml2geojson import convert
 from shapely.geometry import shape, mapping
 from shapely.ops import unary_union
+from fastkml import kml
+import tempfile
+import zipfile as zf
 
-st.title("KMZ → Optimized GeoJSON <1MB (No Geopandas)")
+st.title("KMZ → Optimized GeoJSON <1MB (No Geopandas, No kml2geojson)")
 
 uploaded_file = st.file_uploader("Upload KMZ/KML file", type=["kmz", "kml"])
 max_size_mb = st.number_input("Max file size per chunk (MB)", min_value=0.1, value=1.0, step=0.1)
 
-def simplify_and_round(geom_dict, simplify_tol=0.0001, precision=5):
-    geom = shape(geom_dict)
+def extract_features_from_kmz_kml(file_bytes, filename):
+    """
+    Extract features from KMZ/KML and return as list of shapely geometries with properties.
+    """
+    features = []
+    # KMZ = zip of KML(s)
+    if filename.lower().endswith(".kmz"):
+        with zf.ZipFile(BytesIO(file_bytes)) as kmz_zip:
+            kml_files = [f for f in kmz_zip.namelist() if f.endswith(".kml")]
+            for kml_file in kml_files:
+                kml_data = kmz_zip.read(kml_file)
+                features.extend(extract_features_from_kml_bytes(kml_data))
+    else:  # KML file
+        features.extend(extract_features_from_kml_bytes(file_bytes))
+    return features
+
+def extract_features_from_kml_bytes(kml_bytes):
+    k = kml.KML()
+    k.from_string(kml_bytes)
+    features = []
+    # Recursively extract Placemarks
+    def extract_from_feature(f, parent_props={}):
+        props = parent_props.copy()
+        if hasattr(f, 'name') and f.name:
+            props['name'] = f.name
+        if hasattr(f, 'description') and f.description:
+            props['description'] = f.description
+        if hasattr(f, 'geometry') and f.geometry:
+            features.append({'geometry': f.geometry, 'properties': props})
+        if hasattr(f, 'features'):
+            for subf in f.features():
+                extract_from_feature(subf, props)
+    for doc in k.features():
+        extract_from_feature(doc)
+    return features
+
+def simplify_and_round(geom, simplify_tol=0.0001, precision=5):
     if simplify_tol > 0:
         geom = geom.simplify(simplify_tol, preserve_topology=True)
     geom_dict = mapping(geom)
@@ -26,57 +62,50 @@ def simplify_and_round(geom_dict, simplify_tol=0.0001, precision=5):
     geom_dict['coordinates'] = round_coords(geom_dict['coordinates'])
     return geom_dict
 
-def split_geojson(geojson_data, max_size_bytes):
-    features = geojson_data['features']
+def split_geojson(features, max_size_bytes):
     chunks = []
     current_chunk = {"type":"FeatureCollection","features":[]}
-    for feature in features:
-        current_chunk['features'].append(feature)
+    for feat in features:
+        current_chunk['features'].append(feat)
         size = len(json.dumps(current_chunk).encode('utf-8'))
         if size > max_size_bytes:
             current_chunk['features'].pop()
             if current_chunk['features']:
                 chunks.append(current_chunk)
-            current_chunk = {"type":"FeatureCollection","features":[feature]}
+            current_chunk = {"type":"FeatureCollection","features":[feat]}
     if current_chunk['features']:
         chunks.append(current_chunk)
     return chunks
 
 if uploaded_file:
     try:
-        # Convert KMZ/KML to GeoJSON (in memory)
-        with ZipFile(uploaded_file) if uploaded_file.name.endswith(".kmz") else None as kmz_zip:
-            convert.convert(uploaded_file.name if not kmz_zip else kmz_zip, "./tmp_geojson", format='geojson')
-        
-        # Read all GeoJSON files from tmp_geojson
-        import glob, os
-        geojson_files = glob.glob("./tmp_geojson/*.geojson")
-        features = []
-        for f in geojson_files:
-            with open(f,'r', encoding='utf-8') as gf:
-                data = json.load(gf)
-                for feat in data['features']:
-                    # Simplify & round
-                    feat['geometry'] = simplify_and_round(feat['geometry'], simplify_tol=0.0001, precision=5)
-                    features.append(feat)
+        raw_bytes = uploaded_file.read()
+        st.info("Extracting features from KMZ/KML...")
+        features_raw = extract_features_from_kmz_kml(raw_bytes, uploaded_file.name)
 
-        geojson_data = {"type":"FeatureCollection","features":features}
+        st.info("Simplifying and rounding geometries...")
+        features_processed = []
+        for f in stqdm(features_raw, desc="Processing features"):
+            geom = f['geometry']
+            props = f['properties']
+            simplified_geom = simplify_and_round(geom, simplify_tol=0.0001, precision=5)
+            features_processed.append({"type":"Feature", "properties":props, "geometry":simplified_geom})
 
         max_size_bytes = int(max_size_mb * 1024 * 1024)
-        chunks = split_geojson(geojson_data, max_size_bytes)
-        st.success(f"File converted into {len(chunks)} chunk(s).")
+        st.info("Splitting into chunks...")
+        chunks = split_geojson(features_processed, max_size_bytes)
+        st.success(f"Converted into {len(chunks)} chunk(s).")
 
-        # ZIP download
         zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
+        with zipfile.ZipFile(zip_buffer, "w") as zf_obj:
             for i, chunk in enumerate(chunks, start=1):
-                zf.writestr(f"geojson_chunk_{i}.geojson", json.dumps(chunk, indent=2))
+                zf_obj.writestr(f"geojson_chunk_{i}.geojson", json.dumps(chunk, indent=2))
+
         st.download_button(
             label="Download all chunks as ZIP",
             data=zip_buffer.getvalue(),
             file_name="geojson_chunks.zip",
             mime="application/zip"
         )
-
     except Exception as e:
         st.error(f"Error: {e}")
