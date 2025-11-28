@@ -3,57 +3,54 @@ import zipfile
 import json
 from io import BytesIO
 from shapely.geometry import shape, mapping
-from shapely.ops import unary_union
 from fastkml import kml
-import tempfile
 import zipfile as zf
 
-st.title("KMZ → Optimized GeoJSON <1MB (No Geopandas, No kml2geojson)")
+st.title("KMZ → Optimized GeoJSON <1MB (Safe Version)")
 
 uploaded_file = st.file_uploader("Upload KMZ/KML file", type=["kmz", "kml"])
 max_size_mb = st.number_input("Max file size per chunk (MB)", min_value=0.1, value=1.0, step=0.1)
 
 def extract_features_from_kmz_kml(file_bytes, filename):
     """
-    Extract features from KMZ/KML and return as list of shapely geometries with properties.
+    Extract features from KMZ/KML and return as list of dicts {'geometry': shapely, 'properties': dict}
     """
-    features = []
-    # KMZ = zip of KML(s)
+    extracted_features = []
     if filename.lower().endswith(".kmz"):
         with zf.ZipFile(BytesIO(file_bytes)) as kmz_zip:
             kml_files = [f for f in kmz_zip.namelist() if f.endswith(".kml")]
             for kml_file in kml_files:
                 kml_data = kmz_zip.read(kml_file)
-                features.extend(extract_features_from_kml_bytes(kml_data))
-    else:  # KML file
-        features.extend(extract_features_from_kml_bytes(file_bytes))
-    return features
+                extracted_features.extend(extract_features_from_kml_bytes(kml_data))
+    else:
+        extracted_features.extend(extract_features_from_kml_bytes(file_bytes))
+    return extracted_features
 
 def extract_features_from_kml_bytes(kml_bytes):
     k = kml.KML()
     k.from_string(kml_bytes)
-    features = []
-    # Recursively extract Placemarks
-    def extract_from_feature(f, parent_props={}):
-        props = parent_props.copy()
+    features_list = []
+
+    def recursive_extract(f, parent_props=None):
+        props = dict(parent_props) if parent_props else {}
         if hasattr(f, 'name') and f.name:
             props['name'] = f.name
         if hasattr(f, 'description') and f.description:
             props['description'] = f.description
         if hasattr(f, 'geometry') and f.geometry:
-            features.append({'geometry': f.geometry, 'properties': props})
+            features_list.append({'geometry': f.geometry, 'properties': props})
         if hasattr(f, 'features'):
             for subf in f.features():
-                extract_from_feature(subf, props)
+                recursive_extract(subf, props)
+
     for doc in k.features():
-        extract_from_feature(doc)
-    return features
+        recursive_extract(doc)
+    return features_list
 
 def simplify_and_round(geom, simplify_tol=0.0001, precision=5):
     if simplify_tol > 0:
         geom = geom.simplify(simplify_tol, preserve_topology=True)
     geom_dict = mapping(geom)
-    # Round coordinates
     def round_coords(coords):
         if isinstance(coords[0], (float,int)):
             return [round(coords[0], precision), round(coords[1], precision)]
@@ -62,10 +59,10 @@ def simplify_and_round(geom, simplify_tol=0.0001, precision=5):
     geom_dict['coordinates'] = round_coords(geom_dict['coordinates'])
     return geom_dict
 
-def split_geojson(features, max_size_bytes):
+def split_geojson(features_list, max_size_bytes):
     chunks = []
     current_chunk = {"type":"FeatureCollection","features":[]}
-    for feat in features:
+    for feat in features_list:
         current_chunk['features'].append(feat)
         size = len(json.dumps(current_chunk).encode('utf-8'))
         if size > max_size_bytes:
@@ -80,12 +77,12 @@ def split_geojson(features, max_size_bytes):
 if uploaded_file:
     try:
         raw_bytes = uploaded_file.read()
-        st.info("Extracting features from KMZ/KML...")
+        st.info("Extracting features...")
         features_raw = extract_features_from_kmz_kml(raw_bytes, uploaded_file.name)
 
         st.info("Simplifying and rounding geometries...")
         features_processed = []
-        for f in stqdm(features_raw, desc="Processing features"):
+        for f in features_raw:
             geom = f['geometry']
             props = f['properties']
             simplified_geom = simplify_and_round(geom, simplify_tol=0.0001, precision=5)
