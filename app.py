@@ -40,10 +40,10 @@ def extract_features_from_kml_bytes(kml_bytes):
         if hasattr(f, 'geometry') and f.geometry:
             features_list.append({'geometry': f.geometry, 'properties': props})
         if hasattr(f, 'features'):
-            for subf in f.features():
+            for subf in f.features:  # PERBAIKAN: hapus ()
                 recursive_extract(subf, props)
 
-    for doc in k.features():
+    for doc in k.features():  # Ini benar, karena k.features() adalah method
         recursive_extract(doc)
     return features_list
 
