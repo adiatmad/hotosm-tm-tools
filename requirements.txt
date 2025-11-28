@@ -1,3 +1,4 @@
 streamlit
 shapely
-kml2geojson
+fastkml
+stqdm
