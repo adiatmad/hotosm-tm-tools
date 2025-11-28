@@ -2,16 +2,21 @@ import streamlit as st
 import zipfile
 import json
 from io import BytesIO
-from shapely.geometry import Point, LineString, Polygon, mapping
+from shapely.geometry import Point, LineString, Polygon, mapping, box
+from shapely.ops import split, unary_union
 from lxml import etree
+import math
 
-st.title("KMZ/KML → Optimized GeoJSON <1MB (Safe, No fastkml)")
+st.title("KMZ/KML → Optimized GeoJSON <1MB (Hybrid Tiling + Auto-Tuning)")
 
 uploaded_file = st.file_uploader("Upload KMZ/KML file", type=["kmz", "kml"])
 max_size_mb = st.number_input("Max file size per chunk (MB)", min_value=0.1, value=1.0, step=0.1)
+tile_size_deg = st.number_input("Tile size in degrees (for large areas)", min_value=0.01, value=0.5, step=0.1)
 
+# ----------------------------
+# KML Parsing
+# ----------------------------
 def parse_kml_placemarks(kml_content):
-    """Extract Placemarks from KML content and convert to Shapely geometries"""
     ns = {'kml': 'http://www.opengis.net/kml/2.2'}
     root = etree.fromstring(kml_content)
     placemarks = root.xpath(".//kml:Placemark", namespaces=ns)
@@ -45,7 +50,6 @@ def parse_kml_placemarks(kml_content):
     return features
 
 def extract_features_from_file(file_bytes, filename):
-    """Handle KMZ or KML file and extract all features"""
     all_features = []
     if filename.lower().endswith(".kmz"):
         with zipfile.ZipFile(BytesIO(file_bytes)) as kmz_zip:
@@ -57,7 +61,10 @@ def extract_features_from_file(file_bytes, filename):
         all_features.extend(parse_kml_placemarks(file_bytes))
     return all_features
 
-def simplify_and_round(shapely_geom, simplify_tol=0.0001, precision=5):
+# ----------------------------
+# Simplify + Round
+# ----------------------------
+def simplify_and_round(shapely_geom, simplify_tol=0.0, precision=5):
     if simplify_tol > 0:
         shapely_geom = shapely_geom.simplify(simplify_tol, preserve_topology=True)
     geom_dict = mapping(shapely_geom)
@@ -69,6 +76,27 @@ def simplify_and_round(shapely_geom, simplify_tol=0.0001, precision=5):
     geom_dict['coordinates'] = round_coords(geom_dict['coordinates'])
     return geom_dict
 
+# ----------------------------
+# Tiling
+# ----------------------------
+def tile_geometry(geom, tile_size_deg):
+    minx, miny, maxx, maxy = geom.bounds
+    tiles = []
+    x_count = math.ceil((maxx - minx) / tile_size_deg)
+    y_count = math.ceil((maxy - miny) / tile_size_deg)
+    for i in range(x_count):
+        for j in range(y_count):
+            tile_box = box(minx + i*tile_size_deg, miny + j*tile_size_deg,
+                           min(minx + (i+1)*tile_size_deg, maxx),
+                           min(miny + (j+1)*tile_size_deg, maxy))
+            intersection = geom.intersection(tile_box)
+            if not intersection.is_empty:
+                tiles.append(intersection)
+    return tiles
+
+# ----------------------------
+# Split GeoJSON by size
+# ----------------------------
 def split_geojson(features_list, max_size_bytes):
     chunks = []
     current_chunk = {"type": "FeatureCollection", "features": []}
@@ -84,32 +112,50 @@ def split_geojson(features_list, max_size_bytes):
         chunks.append(current_chunk)
     return chunks
 
+# ----------------------------
+# Main
+# ----------------------------
 if uploaded_file:
     try:
         file_bytes = uploaded_file.read()
         st.info("Extracting features...")
-        extracted_features = extract_features_from_file(file_bytes, uploaded_file.name)
+        features = extract_features_from_file(file_bytes, uploaded_file.name)
 
-        st.info("Simplifying and rounding geometries...")
-        processed_features = []
-        for f in extracted_features:
+        st.info("Tiling geometries...")
+        tiled_features = []
+        for f in features:
             geom = f['geometry']
             props = f['properties']
-            simplified_geom = simplify_and_round(geom, simplify_tol=0.0001, precision=5)
-            processed_features.append({
-                "type": "Feature",
-                "properties": props,
-                "geometry": simplified_geom
-            })
+            tiles = tile_geometry(geom, tile_size_deg)
+            for t in tiles:
+                tiled_features.append({'geometry': t, 'properties': props})
 
+        st.info("Auto-tuning simplify + rounding for target size...")
         max_bytes = int(max_size_mb * 1024 * 1024)
-        st.info("Splitting features into chunks...")
-        geojson_chunks = split_geojson(processed_features, max_bytes)
-        st.success(f"Conversion done: {len(geojson_chunks)} chunk(s).")
+        simplify_tol = 0.0
+        precision = 6
+        while True:
+            processed_features = []
+            for f in tiled_features:
+                geom = f['geometry']
+                props = f['properties']
+                simplified_geom = simplify_and_round(geom, simplify_tol=simplify_tol, precision=precision)
+                processed_features.append({"type": "Feature", "properties": props, "geometry": simplified_geom})
+            chunks = split_geojson(processed_features, max_bytes)
+            if len(chunks) <= math.ceil(len(processed_features) * 100000 / max_bytes):
+                break
+            simplify_tol += 0.00005
+            if simplify_tol > 0.001:
+                precision -= 1
+                simplify_tol = 0.0001
+            if precision < 3:
+                break
+
+        st.success(f"Conversion done: {len(chunks)} chunk(s).")
 
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            for i, chunk in enumerate(geojson_chunks, start=1):
+            for i, chunk in enumerate(chunks, start=1):
                 zip_file.writestr(f"geojson_chunk_{i}.geojson", json.dumps(chunk, indent=2))
 
         st.download_button(
