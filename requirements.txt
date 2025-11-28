@@ -1,5 +1,3 @@
 streamlit
-requests
-pandas
 shapely
-pydeck
+kml2geojson
