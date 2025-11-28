@@ -1,58 +1,16 @@
 import streamlit as st
-import zipfile
 import json
-from io import BytesIO
-from shapely.geometry import Point, Polygon, mapping, MultiPolygon
+from shapely.geometry import shape, mapping, Polygon, MultiPolygon
 from shapely.ops import unary_union
-from lxml import etree
+from io import BytesIO
+import zipfile
 import math
 
-st.title("HOT TM Boundary Optimizer (<1MB)")
+st.title("GeoJSON Optimizer for HOT Tasking Manager (<1MB)")
 
-uploaded_file = st.file_uploader("Upload KMZ/KML file", type=["kmz", "kml"])
-target_size_mb = st.number_input("Target max file size (MB)", min_value=0.1, value=1.0, step=0.1)
-resample_points = st.number_input("Approx. number of points per polygon", min_value=10, value=50, step=10)
-
-# ----------------------------
-# KML Parsing
-# ----------------------------
-def parse_kml_placemarks(kml_content):
-    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
-    root = etree.fromstring(kml_content)
-    placemarks = root.xpath(".//kml:Placemark", namespaces=ns)
-    features = []
-    for pm in placemarks:
-        geom = None
-        point_el = pm.find(".//kml:Point/kml:coordinates", ns)
-        line_el = pm.find(".//kml:LineString/kml:coordinates", ns)
-        poly_el = pm.find(".//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns)
-
-        if point_el is not None:
-            coords = [float(c) for c in point_el.text.strip().split(",")[:2]]
-            geom = Point(coords)
-        elif line_el is not None:
-            coords = [tuple(map(float, c.strip().split(",")[:2])) for c in line_el.text.strip().split()]
-            geom = Polygon(coords)
-        elif poly_el is not None:
-            coords = [tuple(map(float, c.strip().split(",")[:2])) for c in poly_el.text.strip().split()]
-            geom = Polygon(coords)
-
-        if geom:
-            features.append(geom)
-    return features
-
-def extract_features(file_bytes, filename):
-    import zipfile
-    all_features = []
-    if filename.lower().endswith(".kmz"):
-        with zipfile.ZipFile(BytesIO(file_bytes)) as kmz_zip:
-            kml_files = [f for f in kmz_zip.namelist() if f.endswith(".kml")]
-            for kml_file in kml_files:
-                kml_content = kmz_zip.read(kml_file)
-                all_features.extend(parse_kml_placemarks(kml_content))
-    else:
-        all_features.extend(parse_kml_placemarks(file_bytes))
-    return all_features
+uploaded_file = st.file_uploader("Upload large GeoJSON", type=["geojson"])
+target_size_mb = st.number_input("Target max file size per chunk (MB)", min_value=0.1, value=1.0, step=0.1)
+resample_points = st.number_input("Approx. points per polygon", min_value=10, value=100, step=10)
 
 # ----------------------------
 # Resample / Reduce Points
@@ -68,56 +26,67 @@ def resample_polygon(polygon, num_points):
     return Polygon(new_coords)
 
 # ----------------------------
+# Split GeoJSON by size
+# ----------------------------
+def split_geojson(features_list, max_size_bytes):
+    chunks = []
+    current_chunk = {"type":"FeatureCollection","features":[]}
+    for f in features_list:
+        current_chunk['features'].append(f)
+        size = len(json.dumps(current_chunk).encode('utf-8'))
+        if size > max_size_bytes:
+            current_chunk['features'].pop()
+            if current_chunk['features']:
+                chunks.append(current_chunk)
+            current_chunk = {"type":"FeatureCollection","features":[f]}
+    if current_chunk['features']:
+        chunks.append(current_chunk)
+    return chunks
+
+# ----------------------------
 # Main
 # ----------------------------
 if uploaded_file:
     try:
-        file_bytes = uploaded_file.read()
-        st.info("Extracting geometries...")
-        features = extract_features(file_bytes, uploaded_file.name)
+        geojson_data = json.load(uploaded_file)
+        features = geojson_data.get("features", [])
 
-        st.info("Union all polygons...")
-        unioned = unary_union(features)
-        # ensure MultiPolygon for consistent processing
+        st.info("Converting to Shapely geometries...")
+        geoms = []
+        for f in features:
+            geom = shape(f["geometry"])
+            geoms.append(geom)
+
+        st.info("Union all polygons to reduce feature count...")
+        unioned = unary_union(geoms)
         if isinstance(unioned, Polygon):
             unioned = MultiPolygon([unioned])
 
-        st.info("Resampling polygons...")
-        resampled_features = []
+        st.info("Resampling polygons to reduce points...")
+        processed_features = []
         for poly in unioned.geoms:
             resampled = resample_polygon(poly, int(resample_points))
-            resampled_features.append({
-                "type": "Feature",
-                "properties": {},
-                "geometry": mapping(resampled)
+            processed_features.append({
+                "type":"Feature",
+                "properties":{},
+                "geometry":mapping(resampled)
             })
 
-        max_bytes = int(target_size_mb * 1024 * 1024)
-        # optional: split into chunks if still > max size
-        chunks = []
-        current_chunk = {"type":"FeatureCollection","features":[]}
-        for f in resampled_features:
-            current_chunk["features"].append(f)
-            size = len(json.dumps(current_chunk).encode('utf-8'))
-            if size > max_bytes:
-                current_chunk["features"].pop()
-                if current_chunk["features"]:
-                    chunks.append(current_chunk)
-                current_chunk = {"type":"FeatureCollection","features":[f]}
-        if current_chunk["features"]:
-            chunks.append(current_chunk)
+        max_bytes = int(target_size_mb*1024*1024)
+        st.info("Splitting into chunks if needed...")
+        chunks = split_geojson(processed_features, max_bytes)
 
-        st.success(f"Done: {len(chunks)} chunk(s)")
+        st.success(f"Done! {len(chunks)} chunk(s) ready for HOT TM")
 
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer,"w") as zf:
             for i,c in enumerate(chunks,1):
-                zf.writestr(f"geojson_boundary_{i}.geojson",json.dumps(c,indent=2))
+                zf.writestr(f"geojson_chunk_{i}.geojson",json.dumps(c, separators=(',',':')))
 
         st.download_button(
-            label="Download ZIP of optimized boundaries",
+            label="Download ZIP of optimized GeoJSON",
             data=zip_buffer.getvalue(),
-            file_name="geojson_boundary.zip",
+            file_name="geojson_chunks.zip",
             mime="application/zip"
         )
 
