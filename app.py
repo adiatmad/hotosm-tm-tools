@@ -2,54 +2,60 @@ import streamlit as st
 import zipfile
 import json
 from io import BytesIO
-from shapely.geometry import shape, mapping
-from fastkml import kml
-import zipfile as zf
+from shapely.geometry import Point, LineString, Polygon, mapping
+from lxml import etree
 
-st.title("KMZ → Optimized GeoJSON <1MB (Safe Final Version)")
+st.title("KMZ/KML → Optimized GeoJSON <1MB (Safe, No fastkml)")
 
 uploaded_file = st.file_uploader("Upload KMZ/KML file", type=["kmz", "kml"])
 max_size_mb = st.number_input("Max file size per chunk (MB)", min_value=0.1, value=1.0, step=0.1)
 
-def extract_features_from_kmz_kml(file_bytes, filename):
-    """
-    Extract features from KMZ/KML, return list of dicts {'geometry': shapely, 'properties': dict}
-    """
-    all_features = []
+def parse_kml_placemarks(kml_content):
+    """Extract Placemarks from KML content and convert to Shapely geometries"""
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+    root = etree.fromstring(kml_content)
+    placemarks = root.xpath(".//kml:Placemark", namespaces=ns)
+    features = []
+    for pm in placemarks:
+        props = {}
+        name_el = pm.find("kml:name", ns)
+        if name_el is not None:
+            props['name'] = name_el.text
+        desc_el = pm.find("kml:description", ns)
+        if desc_el is not None:
+            props['description'] = desc_el.text
 
+        geom = None
+        point_el = pm.find(".//kml:Point/kml:coordinates", ns)
+        line_el = pm.find(".//kml:LineString/kml:coordinates", ns)
+        poly_el = pm.find(".//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns)
+
+        if point_el is not None:
+            coords = [float(c) for c in point_el.text.strip().split(",")[:2]]
+            geom = Point(coords)
+        elif line_el is not None:
+            coords = [tuple(map(float, c.strip().split(",")[:2])) for c in line_el.text.strip().split()]
+            geom = LineString(coords)
+        elif poly_el is not None:
+            coords = [tuple(map(float, c.strip().split(",")[:2])) for c in poly_el.text.strip().split()]
+            geom = Polygon(coords)
+
+        if geom:
+            features.append({'geometry': geom, 'properties': props})
+    return features
+
+def extract_features_from_file(file_bytes, filename):
+    """Handle KMZ or KML file and extract all features"""
+    all_features = []
     if filename.lower().endswith(".kmz"):
-        with zf.ZipFile(BytesIO(file_bytes)) as kmz_zip:
+        with zipfile.ZipFile(BytesIO(file_bytes)) as kmz_zip:
             kml_files_in_kmz = [f for f in kmz_zip.namelist() if f.endswith(".kml")]
             for kml_file_name in kml_files_in_kmz:
-                kml_bytes = kmz_zip.read(kml_file_name)
-                all_features.extend(extract_features_from_kml_bytes(kml_bytes))
-    else:  # KML file
-        all_features.extend(extract_features_from_kml_bytes(file_bytes))
+                kml_content = kmz_zip.read(kml_file_name)
+                all_features.extend(parse_kml_placemarks(kml_content))
+    else:
+        all_features.extend(parse_kml_placemarks(file_bytes))
     return all_features
-
-def extract_features_from_kml_bytes(kml_bytes):
-    kml_document = kml.KML()
-    kml_document.from_string(kml_bytes)
-    feature_dict_list = []
-
-    def recursive_extract(feature_obj, parent_props=None):
-        props = dict(parent_props) if parent_props else {}
-        if hasattr(feature_obj, 'name') and feature_obj.name:
-            props['name'] = feature_obj.name
-        if hasattr(feature_obj, 'description') and feature_obj.description:
-            props['description'] = feature_obj.description
-        if hasattr(feature_obj, 'geometry') and feature_obj.geometry:
-            feature_dict_list.append({
-                "geometry": feature_obj.geometry,
-                "properties": props
-            })
-        if hasattr(feature_obj, 'features'):
-            for subf in feature_obj.features():
-                recursive_extract(subf, props)
-
-    for doc_obj in kml_document.features():
-        recursive_extract(doc_obj)
-    return feature_dict_list
 
 def simplify_and_round(shapely_geom, simplify_tol=0.0001, precision=5):
     if simplify_tol > 0:
@@ -66,14 +72,14 @@ def simplify_and_round(shapely_geom, simplify_tol=0.0001, precision=5):
 def split_geojson(features_list, max_size_bytes):
     chunks = []
     current_chunk = {"type": "FeatureCollection", "features": []}
-    for feature in features_list:
-        current_chunk["features"].append(feature)
-        size = len(json.dumps(current_chunk).encode("utf-8"))
+    for feat in features_list:
+        current_chunk["features"].append(feat)
+        size = len(json.dumps(current_chunk).encode('utf-8'))
         if size > max_size_bytes:
             current_chunk["features"].pop()
             if current_chunk["features"]:
                 chunks.append(current_chunk)
-            current_chunk = {"type": "FeatureCollection", "features": [feature]}
+            current_chunk = {"type": "FeatureCollection", "features": [feat]}
     if current_chunk["features"]:
         chunks.append(current_chunk)
     return chunks
@@ -81,8 +87,8 @@ def split_geojson(features_list, max_size_bytes):
 if uploaded_file:
     try:
         file_bytes = uploaded_file.read()
-        st.info("Extracting features from KMZ/KML...")
-        extracted_features = extract_features_from_kmz_kml(file_bytes, uploaded_file.name)
+        st.info("Extracting features...")
+        extracted_features = extract_features_from_file(file_bytes, uploaded_file.name)
 
         st.info("Simplifying and rounding geometries...")
         processed_features = []
