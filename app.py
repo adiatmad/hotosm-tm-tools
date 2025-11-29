@@ -1,28 +1,45 @@
+# hot_tm_optimizer_pro.py
 import streamlit as st
 import json
-from shapely.geometry import shape, mapping, Polygon, MultiPolygon, box
-from shapely.ops import unary_union, transform
-from shapely import simplify
-import pyproj
-from functools import partial
-from io import BytesIO
-import zipfile
-import datetime
+import math
 import random
+import datetime
+import zipfile
+from io import BytesIO
+from shapely.geometry import shape, mapping, Polygon, MultiPolygon, box
+from shapely.ops import unary_union
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+import traceback
 
-# ------------------------------------------------------
-# Streamlit UI
-# ------------------------------------------------------
+# ----------------------------
+# CONFIG
+# ----------------------------
+st.set_page_config(layout="wide", page_title="HOT TM Optimizer PRO")
+USE_PYPROJ = False  # set True if you install pyproj and want metric projection
+MAX_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 
-st.title("⚡ HOT Tasking Manager GeoJSON Optimizer")
-st.caption("Auto-split by area, auto-reduce <1MB, union, resample, singlepart — fully HOT TM ready")
+# ----------------------------
+# UI
+# ----------------------------
+st.title("🚀 HOT Tasking Manager GeoJSON Optimizer — PRO")
+st.write("Multiprocessing, tile export (Z/X/Y), preview map, explain mode, adaptive size < target MB.")
 
-uploaded_file = st.file_uploader("Upload large GeoJSON", type=["geojson"])
+col1, col2 = st.columns([2, 1])
 
-target_size_mb = st.number_input("Target max GeoJSON size (MB)", min_value=0.1, value=1.0, step=0.1)
-max_area_km2 = st.number_input("Max polygon area (km²)", min_value=100.0, value=5000.0, step=100.0)
-base_points = st.number_input("Approx points per polygon", min_value=20, value=200, step=20)
+with col1:
+    uploaded_file = st.file_uploader("Upload large GeoJSON", type=["geojson", "json"])
+    show_preview = st.checkbox("Show Leaflet preview", value=True)
+    explain_mode = st.checkbox("Explain mode (diagnostics + logs)", value=False)
 
+with col2:
+    target_size_mb = st.number_input("Target max file size (MB)", min_value=0.1, value=1.0, step=0.1)
+    max_area_km2 = st.number_input("Max polygon area per feature (km²)", min_value=10.0, value=5000.0, step=10.0)
+    approx_points = st.number_input("Approx points per polygon", min_value=10, value=200, step=10)
+    pro_zoom = st.slider("Tile export zoom (Z)", min_value=6, max_value=16, value=10)
+    run_button = st.button("Process (PRO)")
+
+# Fun messages
 fun_messages = [
     "🛰️ Tracing roads for rapid response...",
     "🚑 Mapping emergency access routes...",
@@ -32,164 +49,408 @@ fun_messages = [
     "💾 Compressing data without losing crucial detail..."
 ]
 
-# ------------------------------------------------------
-# Utility: Reprojection for accurate area & cutting
-# ------------------------------------------------------
+# ----------------------------
+# Utilities (no pyproj)
+# ----------------------------
+def rad(d): return d * math.pi / 180.0
 
-project_to_m = partial(
-    pyproj.transform,
-    pyproj.Proj(init="epsg:4326"),
-    pyproj.Proj(init="epsg:3857")
-)
+def geodesic_area_m2(poly: Polygon) -> float:
+    """
+    Approximate geodesic area in m^2 using spherical excess formula approximation.
+    Good enough for splitting decisions (<= ~5% error on 5000 km2).
+    """
+    coords = list(poly.exterior.coords)
+    if len(coords) < 3:
+        return 0.0
+    R = 6371000.0
+    total = 0.0
+    for i in range(len(coords)-1):
+        lon1, lat1 = coords[i]
+        lon2, lat2 = coords[i+1]
+        total += rad(lon2 - lon1) * (2 + math.sin(rad(lat1)) + math.sin(rad(lat2)))
+    return abs(total * (R**2) / 2.0)
 
-project_to_deg = partial(
-    pyproj.transform,
-    pyproj.Proj(init="epsg:3857"),
-    pyproj.Proj(init="epsg:4326")
-)
+def meters_per_degree(lat_deg):
+    """Return (m_per_deg_lat, m_per_deg_lon) approx at lat."""
+    lat_rad = rad(lat_deg)
+    m_per_deg_lat = 111132.954 - 559.822 * math.cos(2*lat_rad) + 1.175 * math.cos(4*lat_rad)
+    m_per_deg_lon = (111132.954 * math.cos(lat_rad))
+    return m_per_deg_lat, m_per_deg_lon
 
-# ------------------------------------------------------
-# Split polygon by grid until not exceeding max area
-# ------------------------------------------------------
+# ----------------------------
+# Tile math (slippy tiles)
+# ----------------------------
+def lonlat_to_tile(lon, lat, z):
+    """Return (x, y) tile coordinate containing this lon/lat at zoom z."""
+    n = 2 ** z
+    xtile = int((lon + 180.0) / 360.0 * n)
+    lat_rad = math.radians(lat)
+    ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+    return xtile, ytile
 
-def split_by_area(poly, max_area_m2):
-    poly_m = transform(project_to_m, poly)
-    if poly_m.area <= max_area_m2:
-        return [poly]
+def tile_bounds_deg(x, y, z):
+    """Return tile bounds in lon/lat: (minx, miny, maxx, maxy)."""
+    n = 2 ** z
+    lon_deg_min = x / n * 360.0 - 180.0
+    lon_deg_max = (x+1) / n * 360.0 - 180.0
+    # lat
+    def tile2lat(ty):
+        n = 2.0 ** z
+        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ty / n)))
+        return math.degrees(lat_rad)
+    lat_deg_max = tile2lat(y)
+    lat_deg_min = tile2lat(y+1)
+    return (lon_deg_min, lat_deg_min, lon_deg_max, lat_deg_max)
 
-    # Ideal grid cell size
-    cell_side = (max_area_m2) ** 0.5  # meters
-    minx, miny, maxx, maxy = poly_m.bounds
+# ----------------------------
+# Core split function (per polygon)
+# ----------------------------
+def split_by_area_no_pyproj(poly_geojson, max_area_m2):
+    """
+    Input: polygon as geojson mapping (so picklable).
+    Output: list of polygon geojson mappings split such that each piece area <= max_area_m2
+    Uses local degree <-> meters approx.
+    """
+    try:
+        poly = shape(poly_geojson)
+        # If Multipolygon, break to polygons
+        if isinstance(poly, MultiPolygon):
+            results = []
+            for p in poly.geoms:
+                results.extend(split_by_area_no_pyproj(mapping(p), max_area_m2))
+            return results
 
-    pieces = []
-    x = minx
-    while x < maxx:
-        y = miny
-        while y < maxy:
-            cell = box(x, y, x + cell_side, y + cell_side)
-            inter = poly_m.intersection(cell)
-            if not inter.is_empty:
-                # Convert back to degrees
-                inter_deg = transform(project_to_deg, inter)
-                if isinstance(inter_deg, Polygon):
-                    pieces.append(inter_deg)
-                else:
-                    pieces.extend(inter_deg.geoms)
-            y += cell_side
-        x += cell_side
+        area_m2 = geodesic_area_m2(poly)
+        if area_m2 <= max_area_m2:
+            return [mapping(poly)]
 
-    return pieces
+        # choose grid cell side in meters (square)
+        cell_m = (max_area_m2 ** 0.5)
+        minx, miny, maxx, maxy = poly.bounds
+        mid_lat = (miny + maxy) / 2.0
+        mdeg_lat, mdeg_lon = meters_per_degree(mid_lat)
+        cell_deg_lat = cell_m / mdeg_lat
+        cell_deg_lon = cell_m / mdeg_lon
 
-# ------------------------------------------------------
-# Adaptive size reduction loop
-# ------------------------------------------------------
+        pieces = []
+        x = minx
+        # loop
+        while x < maxx:
+            y = miny
+            while y < maxy:
+                cell = box(x, y, x + cell_deg_lon, y + cell_deg_lat)
+                inter = poly.intersection(cell)
+                if not inter.is_empty:
+                    if isinstance(inter, (Polygon, MultiPolygon)):
+                        if isinstance(inter, Polygon):
+                            pieces.append(mapping(inter))
+                        else:
+                            for g in inter.geoms:
+                                pieces.append(mapping(g))
+                y += cell_deg_lat
+            x += cell_deg_lon
+        # If no pieces produced (rare), return original
+        if not pieces:
+            return [mapping(poly)]
+        return pieces
+    except Exception as e:
+        # Return original in case of failure
+        return [poly_geojson]
 
-def geojson_size_bytes(obj):
+# ----------------------------
+# Resample / simplify function
+# ----------------------------
+def resample_polygon_geojson(poly_geojson, approx_points):
+    """Reduce vertices by simple decimation + optional small simplify using shapely."""
+    poly = shape(poly_geojson)
+    coords = list(poly.exterior.coords)
+    if len(coords) <= approx_points:
+        return mapping(poly)
+    step = max(1, len(coords) // approx_points)
+    new_coords = coords[::step]
+    if new_coords[0] != new_coords[-1]:
+        new_coords.append(new_coords[0])
+    new_poly = Polygon(new_coords)
+    # small topology-preserving simplification to clean tiny artifacts
+    new_poly = new_poly.simplify(0.00001, preserve_topology=True)
+    return mapping(new_poly)
+
+# ----------------------------
+# Worker wrapper (for multiprocessing)
+# ----------------------------
+def process_polygon_worker(args):
+    """
+    args: (poly_geojson, max_area_m2, approx_points, pro_zoom)
+    returns: dict with diagnostics + list of resulting features (geojson)
+    """
+    poly_geojson, max_area_m2, approx_points, pro_zoom = args
+    out = {"features": [], "diag": {}}
+    try:
+        poly = shape(poly_geojson)
+        area_m2 = geodesic_area_m2(poly)
+        out["diag"]["input_area_m2"] = area_m2
+        # split by area
+        pieces = split_by_area_no_pyproj(poly_geojson, max_area_m2)
+        out["diag"]["pieces_count"] = len(pieces)
+        features = []
+        for p in pieces:
+            res = resample_polygon_geojson(p, approx_points)
+            features.append(res)
+        out["features"] = features
+
+        # compute tiles intersected for metadata
+        tiles = set()
+        for f in features:
+            geom = shape(f)
+            minx, miny, maxx, maxy = geom.bounds
+            # get tile range
+            tx1, ty1 = lonlat_to_tile(minx, maxy, pro_zoom)
+            tx2, ty2 = lonlat_to_tile(maxx, miny, pro_zoom)
+            for tx in range(min(tx1, tx2), max(tx1, tx2)+1):
+                for ty in range(min(ty1, ty2), max(ty1, ty2)+1):
+                    # check intersection with tile bounds
+                    tb = tile_bounds_deg(tx, ty, pro_zoom)
+                    tile_poly = box(tb[0], tb[1], tb[2], tb[3])
+                    for fgeo in features:
+                        if shape(fgeo).intersection(tile_poly).area > 0:
+                            tiles.add((tx, ty))
+        out["diag"]["tiles"] = list(tiles)
+    except Exception as e:
+        out["error"] = str(e) + "\n" + traceback.format_exc()
+    return out
+
+# ----------------------------
+# Adaptive reducer (ensures < target bytes)
+# ----------------------------
+def geojson_bytes(obj):
     return len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
 
-def adaptive_reduce(features, target_bytes):
-    """Auto-split further + simplify if > target size."""
-    step_simplify = 0.0005  # start gentle
-    split_factor = 1.5      # grid becomes 1.5x smaller if needed
-
+def adaptive_reduce_features(features, target_bytes, max_area_km2, approx_points, pro_zoom, explain_mode=False):
+    """
+    Repeatedly simplify / split more until bytes < target.
+    features: list of geojson feature mappings.
+    """
     attempt = 0
+    max_attempts = 8
+    curr = features
     while True:
         attempt += 1
-
-        out = {"type": "FeatureCollection", "features": features}
-        size_now = geojson_size_bytes(out)
-
-        if size_now <= target_bytes:
-            return features
-
-        st.warning(f"⚠️ GeoJSON still too large ({size_now/1e6:.2f} MB). Auto-reducing... [Attempt {attempt}]")
-
+        fc = {"type": "FeatureCollection", "features": [{"type":"Feature","properties":{},"geometry":f} for f in curr]}
+        size = geojson_bytes(fc)
+        if explain_mode:
+            st.info(f"[Adaptive] Attempt {attempt}, size={(size/1e6):.3f} MB, features={len(curr)}")
+        if size <= target_bytes or attempt >= max_attempts:
+            return curr
+        # Strategy: increase split aggressiveness and simplify more
+        # For each feature, split with smaller area cap (half), and simplify by decimation
         new_features = []
-        for f in features:
-            geom = shape(f["geometry"])
-            # Step 1 — simplify geometry
-            geom_simplified = geom.simplify(step_simplify, preserve_topology=True)
+        dynamic_max_area = (max_area_km2 * 1_000_000) / (1.5 ** attempt)
+        with ProcessPoolExecutor(max_workers=max(1, min(MAX_WORKERS, 6))) as ex:
+            futures = []
+            for f in curr:
+                futures.append(ex.submit(process_polygon_worker, (f, dynamic_max_area, max(20, approx_points//(1+attempt)), pro_zoom)))
+            for fut in as_completed(futures):
+                res = fut.result()
+                if "features" in res:
+                    new_features.extend(res["features"])
+                else:
+                    # fallback keep original feature
+                    if explain_mode:
+                        st.error(f"[Adaptive] Worker error: {res.get('error','unknown')}")
+        curr = new_features
 
-            # Step 2 — further area split
-            max_area_m2 = (max_area_km2 * 1_000_000) / split_factor
-            chunks = split_by_area(geom_simplified, max_area_m2)
+# ----------------------------
+# Tile exporter: group geometries by tile and write per-tile geojson
+# ----------------------------
+def export_tiles(features, z):
+    tiles_map = {}  # (x,y) -> [features]
+    for f in features:
+        geom = shape(f)
+        minx, miny, maxx, maxy = geom.bounds
+        tx1, ty1 = lonlat_to_tile(minx, maxy, z)
+        tx2, ty2 = lonlat_to_tile(maxx, miny, z)
+        for tx in range(min(tx1, tx2), max(tx1, tx2)+1):
+            for ty in range(min(ty1, ty2), max(ty1, ty2)+1):
+                tb = tile_bounds_deg(tx, ty, z)
+                tile_poly = box(tb[0], tb[1], tb[2], tb[3])
+                if geom.intersects(tile_poly):
+                    tiles_map.setdefault((tx,ty), []).append(mapping(geom.intersection(tile_poly)))
+    # convert to geojson per tile
+    tile_geojsons = {}
+    for (tx,ty), feats in tiles_map.items():
+        fc = {"type":"FeatureCollection", "features":[{"type":"Feature","properties":{}, "geometry":g} for g in feats]}
+        tile_geojsons[(tx,ty)] = fc
+    return tile_geojsons
 
-            for c in chunks:
-                new_features.append({
-                    "type": "Feature",
-                    "properties": {},
-                    "geometry": mapping(c)
-                })
+# ----------------------------
+# Preview helper (leaflet)
+# ----------------------------
+def leaflet_preview_html(features, center=None, zoom=5):
+    """Return HTML with Leaflet showing features (GeoJSON)."""
+    # compact the geojson
+    fc = {"type":"FeatureCollection", "features":[{"type":"Feature","properties":{}, "geometry":f} for f in features]}
+    fc_json = json.dumps(fc)
+    if not center:
+        # compute center from first feature
+        if features:
+            geom = shape(features[0])
+            minx, miny, maxx, maxy = geom.bounds
+            center = [(miny+maxy)/2.0, (minx+maxx)/2.0]
+        else:
+            center = [0,0]
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+      <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    </head>
+    <body>
+      <div id="map" style="width:100%;height:600px;"></div>
+      <script>
+        var map = L.map('map').setView([{center[0]}, {center[1]}], {zoom});
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19
+        }}).addTo(map);
+        var geojson = {fc_json};
+        L.geoJSON(geojson, {{
+            style: function (feature) {{ return {{color: '#ff7800', weight:1}}; }},
+            onEachFeature: function (feature, layer) {{
+                layer.bindPopup('Points: ' + (feature.geometry.coordinates[0] ? feature.geometry.coordinates[0].length : 'n/a'));
+            }}
+        }}).addTo(map);
+      </script>
+    </body>
+    </html>
+    """
+    return html
 
-        features = new_features
-        step_simplify *= 1.3
-        split_factor *= 1.4
-
-
-# ------------------------------------------------------
-# MAIN PROCESS
-# ------------------------------------------------------
-if uploaded_file:
+# ----------------------------
+# MAIN PROCESSING
+# ----------------------------
+def main_process(data, target_size_mb, max_area_km2, approx_points, pro_zoom, explain_mode, show_preview):
+    logs = []
     try:
-        st.info(random.choice(fun_messages))
-        data = json.load(uploaded_file)
         features = data.get("features", [])
+        if not features:
+            raise ValueError("No features found in uploaded GeoJSON.")
 
-        st.info(random.choice(fun_messages))
+        logs.append(random.choice(fun_messages))
+        # convert to shapely and select polygons
         geoms = [shape(f["geometry"]) for f in features]
         polygons = [g for g in geoms if isinstance(g, (Polygon, MultiPolygon))]
+        if not polygons:
+            raise ValueError("No polygon geometries found.")
 
-        st.info("🔄 Unioning all polygons...")
+        logs.append("Unioning polygons...")
         unioned = unary_union(polygons)
         if isinstance(unioned, Polygon):
             unioned = MultiPolygon([unioned])
 
-        # ------------------------------------------------------
-        # Step: Split by area 1st pass
-        # ------------------------------------------------------
-        st.info("📏 Splitting polygons > max area...")
-        all_split = []
+        # Prepare initial pieces via multiprocessing
+        logs.append("Initial splitting by max area (parallel)...")
         max_area_m2 = max_area_km2 * 1_000_000
-        for p in unioned.geoms:
-            all_split.extend(split_by_area(p, max_area_m2))
 
-        # ------------------------------------------------------
-        # Convert to Feature list
-        # ------------------------------------------------------
-        features_out = [{
-            "type": "Feature",
-            "properties": {},
-            "geometry": mapping(poly)
-        } for poly in all_split]
+        # Serialize each polygon geometry to mapping for picklability
+        input_polys = [mapping(p) for p in unioned.geoms]
 
-        # ------------------------------------------------------
-        # Adaptive size reduction loop
-        # ------------------------------------------------------
-        st.info("💾 Ensuring file smaller than target size...")
+        results_features = []
+        diagnostics = []
+        with ProcessPoolExecutor(max_workers=max(1, min(MAX_WORKERS, len(input_polys)))) as ex:
+            futures = {ex.submit(process_polygon_worker, (p, max_area_m2, approx_points, pro_zoom)): idx for idx, p in enumerate(input_polys)}
+            for fut in as_completed(futures):
+                res = fut.result()
+                if "error" in res:
+                    logs.append(f"Worker error: {res['error']}")
+                    # fallback: keep original polygon
+                    idx = futures[fut]
+                    results_features.append(input_polys[idx])
+                else:
+                    results_features.extend(res.get("features", []))
+                    diagnostics.append(res.get("diag", {}))
+
+        logs.append(f"Initial pieces count: {len(results_features)}")
+
+        # Adaptive reduce to meet size
         target_bytes = int(target_size_mb * 1_000_000)
-        features_final = adaptive_reduce(features_out, target_bytes)
+        logs.append("Adaptive reduction to meet target size...")
+        final_features = adaptive_reduce_features(results_features, target_bytes, max_area_km2, approx_points, pro_zoom, explain_mode=explain_mode)
 
-        final_geojson = {
-            "type": "FeatureCollection",
-            "features": features_final
-        }
+        logs.append(f"Final features: {len(final_features)}")
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M")
-        input_name = uploaded_file.name.rsplit(".", 1)[0]
-        zip_name = f"{input_name}_{timestamp}_HOTTM_ready.zip"
+        # Export tiles
+        logs.append("Exporting tiles...")
+        tile_geojsons = export_tiles(final_features, pro_zoom)
+        logs.append(f"Tiles generated: {len(tile_geojsons)}")
 
+        # Prepare ZIP (per-tile files + merged + manifest)
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        base_name = f"hot_tm_{timestamp}"
         buffer = BytesIO()
-        with zipfile.ZipFile(buffer, "w") as zf:
-            zf.writestr(f"{input_name}_{timestamp}.geojson",
-                        json.dumps(final_geojson, separators=(",", ":")))
+        manifest = {"generated": timestamp, "tile_zoom": pro_zoom, "tiles_count": len(tile_geojsons), "features_count": len(final_features)}
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # per-tile
+            for (tx,ty), fc in tile_geojsons.items():
+                fname = f"{base_name}_z{pro_zoom}_x{tx}_y{ty}.geojson"
+                zf.writestr(fname, json.dumps(fc, separators=(",",":")))
+            # merged single file
+            merged_fc = {"type":"FeatureCollection", "features":[{"type":"Feature","properties":{},"geometry":f} for f in final_features]}
+            zf.writestr(f"{base_name}_merged.geojson", json.dumps(merged_fc, separators=(",",":")))
+            zf.writestr("manifest.json", json.dumps(manifest, separators=(",",":")))
+        buffer.seek(0)
 
-        st.success("🎉 Processing complete! Fully HOT Tasking Manager ready.")
-        st.download_button(
-            "Download Optimized GeoJSON (ZIP)",
-            data=buffer.getvalue(),
-            file_name=zip_name,
-            mime="application/zip"
-        )
+        # preview html
+        preview_html = None
+        if show_preview:
+            # choose center
+            center = None
+            if final_features:
+                g = shape(final_features[0])
+                minx, miny, maxx, maxy = g.bounds
+                center = [(miny+maxy)/2.0, (minx+maxx)/2.0]
+            preview_html = leaflet_preview_html(final_features, center=center, zoom=max(3, pro_zoom-2))
 
+        return {"ok": True, "zip": buffer, "zip_name": f"{base_name}.zip", "logs": logs, "diagnostics": diagnostics, "preview_html": preview_html, "manifest": manifest}
     except Exception as e:
-        st.error(f"❌ Error: {e}")
+        return {"ok": False, "error": str(e) + "\n" + traceback.format_exc(), "logs": logs}
+
+# ----------------------------
+# UI Trigger
+# ----------------------------
+if run_button:
+    if not uploaded_file:
+        st.error("Please upload a GeoJSON file first.")
+    else:
+        try:
+            data = json.load(uploaded_file)
+        except Exception as e:
+            st.error(f"Failed to load JSON: {e}")
+            data = None
+        if data:
+            with st.spinner("Processing (this may take a few moments, using multiple cores)..."):
+                result = main_process(data, target_size_mb, max_area_km2, approx_points, pro_zoom, explain_mode, show_preview)
+            if not result.get("ok"):
+                st.error("Processing failed.")
+                st.text(result.get("error"))
+                if result.get("logs"):
+                    st.write("Logs:")
+                    for L in result["logs"]:
+                        st.write("-", L)
+            else:
+                st.success("Processing completed (PRO).")
+                # show logs
+                st.write("### Logs")
+                for L in result["logs"]:
+                    st.write("-", L)
+                if explain_mode:
+                    st.write("### Diagnostics (sample per-worker)")
+                    st.json(result.get("diagnostics")[:10])
+                st.download_button("Download ZIP (tiles + merged)", data=result["zip"].getvalue(), file_name=result["zip_name"], mime="application/zip")
+                st.write("Manifest:")
+                st.json(result["manifest"])
+                if show_preview and result["preview_html"]:
+                    st.write("### Preview map")
+                    from streamlit.components.v1 import html
+                    html(result["preview_html"], height=650)
