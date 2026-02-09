@@ -1,5 +1,6 @@
 streamlit
-shapely
-lxml
-pyproj
 shapely>=2.0
+pyproj
+lxml
+folium
+streamlit-folium
