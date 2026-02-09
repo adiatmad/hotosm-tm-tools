@@ -1,191 +1,150 @@
-# ============================================================
-# HOT TM AREA SPLITTER - FINAL STABLE VERSION
-# ============================================================
-# - Equal-area recursive polygon split
-# - Target block size ~5000 km²
-# - Leaflet preview
-# - ZIP download output
-# ============================================================
-
+# app.py
 import streamlit as st
-import json, zipfile, traceback
-from io import BytesIO
-
+import json, zipfile, math, tempfile, os
 from shapely.geometry import shape, mapping, Polygon, MultiPolygon, box
 from shapely.ops import unary_union, transform
-from pyproj import Transformer, CRS
+from pyproj import Transformer
 
-import folium
-from streamlit_folium import st_folium
-
-# ============================================================
+# --------------------------------------------------
 # CONFIG
-# ============================================================
-
-st.set_page_config(page_title="HOT TM Area Splitter", layout="wide")
-
-DEFAULT_TARGET = 5000.0
-
-EA_CRS = CRS.from_epsg(6933)   # Equal Area
-WGS84 = CRS.from_epsg(4326)
+# --------------------------------------------------
+TARGET_KM2 = 5000
+EA_CRS = "EPSG:6933"   # World Cylindrical Equal Area
+WGS84 = "EPSG:4326"
 
 to_ea = Transformer.from_crs(WGS84, EA_CRS, always_xy=True).transform
 to_wgs = Transformer.from_crs(EA_CRS, WGS84, always_xy=True).transform
 
-# ============================================================
-# UI
-# ============================================================
+st.set_page_config(page_title="GeoJSON Area Splitter 5000 km²", layout="wide")
+st.title("🗺️ GeoJSON Splitter → 5000 km² Polygons")
 
-st.title("🗺️ HOT TM Area Splitter (5000 km² Blocks)")
+# --------------------------------------------------
+# SPLIT RECURSIVE
+# --------------------------------------------------
+def split_recursive(poly, max_area):
 
-uploaded = st.file_uploader("Upload GeoJSON", type=["geojson","json"])
-target_km2 = st.number_input(
-    "Target area per polygon (km²)",
-    value=DEFAULT_TARGET,
-    min_value=100.0
-)
-
-run = st.button("Process")
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def split_recursive(poly, max_area_m2, depth=0, max_depth=12):
-
-    # stop if close enough
-    if poly.area <= max_area_m2 * 1.05:
-        return [poly]
-
-    # safety stop
-    if depth >= max_depth:
+    if poly.area <= max_area:
         return [poly]
 
     minx, miny, maxx, maxy = poly.bounds
-    w = maxx - minx
-    h = maxy - miny
+    width = maxx - minx
+    height = maxy - miny
 
-    if w >= h:
-        mid = (minx + maxx) / 2
-        b1 = box(minx, miny, mid, maxy)
-        b2 = box(mid, miny, maxx, maxy)
+    if width >= height:
+        mid = minx + width/2
+        cutter = box(mid, miny, mid, maxy)
     else:
-        mid = (miny + maxy) / 2
-        b1 = box(minx, miny, maxx, mid)
-        b2 = box(minx, mid, maxx, maxy)
+        mid = miny + height/2
+        cutter = box(minx, mid, maxx, mid)
 
-    parts = []
-    for p in [poly.intersection(b1), poly.intersection(b2)]:
-        if not p.is_empty and p.area > 1:
-            parts.extend(
-                split_recursive(p, max_area_m2, depth+1, max_depth)
-            )
+    left = poly.intersection(cutter)
+    right = poly.difference(cutter)
 
-    return parts
+    results = []
+    for part in [left, right]:
+        if not part.is_empty:
+            if isinstance(part, MultiPolygon):
+                for g in part.geoms:
+                    results.extend(split_recursive(g, max_area))
+            else:
+                results.extend(split_recursive(part, max_area))
 
-def extract_coords(geom):
-    coords=[]
-    if geom["type"]=="Polygon":
-        coords.extend(geom["coordinates"][0])
-    elif geom["type"]=="MultiPolygon":
-        for p in geom["coordinates"]:
-            coords.extend(p[0])
-    return coords
+    return results
 
-# ============================================================
+# --------------------------------------------------
 # MAIN PROCESS
-# ============================================================
+# --------------------------------------------------
+def process_geojson(data):
 
-def process(data, target_km2):
+    geoms = [shape(f["geometry"]) for f in data["features"]]
 
-    shapes = [shape(f["geometry"]) for f in data["features"]]
-    merged = unary_union(shapes)
+    # 1. dissolve all
+    merged = unary_union(geoms)
+    merged = merged.buffer(0)
 
-    if isinstance(merged, Polygon):
-        merged = [merged]
-    else:
-        merged = list(merged.geoms)
+    if isinstance(merged, MultiPolygon):
+        merged = unary_union(list(merged.geoms))
 
-    target_m2 = target_km2 * 1_000_000
-    final_parts = []
+    # 2. project to equal-area
+    merged_ea = transform(to_ea, merged)
 
-    for g in merged:
-        g_ea = transform(to_ea, g)
-        pieces = split_recursive(g_ea, target_m2)
-        final_parts.extend(pieces)
+    target_m2 = TARGET_KM2 * 1_000_000
 
-    return {
+    # 3. split
+    pieces_ea = split_recursive(merged_ea, target_m2)
+
+    # 4. back to WGS84
+    pieces = [transform(to_wgs, p) for p in pieces_ea]
+
+    return pieces
+
+# --------------------------------------------------
+# LEAFLET PREVIEW
+# --------------------------------------------------
+def leaflet_html(polys):
+
+    fc = {
         "type":"FeatureCollection",
         "features":[
             {"type":"Feature","properties":{},
-             "geometry":mapping(transform(to_wgs,p))}
-            for p in final_parts
+             "geometry":mapping(p)}
+            for p in polys
         ]
     }
 
-# ============================================================
-# MAP PREVIEW
-# ============================================================
+    center = polys[0].centroid
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+<div id="map" style="height:600px;"></div>
+<script>
+var map = L.map('map').setView([{center.y},{center.x}],6);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png').addTo(map);
+var data = {json.dumps(fc)};
+L.geoJSON(data,{style:{{color:"red",weight:2,fillOpacity:0.2}}}).addTo(map);
+</script>
+</body>
+</html>
+"""
 
-def show_map(fc):
+# --------------------------------------------------
+# UI
+# --------------------------------------------------
+file = st.file_uploader("Upload GeoJSON", type=["geojson","json"])
 
-    coords=[]
-    for f in fc["features"]:
-        coords.extend(extract_coords(f["geometry"]))
+if file:
+    data = json.load(file)
 
-    if coords:
-        lats=[c[1] for c in coords]
-        lons=[c[0] for c in coords]
-        center=[sum(lats)/len(lats), sum(lons)/len(lons)]
-    else:
-        center=[0,0]
+    if st.button("Split to 5000 km²"):
+        polys = process_geojson(data)
 
-    m=folium.Map(location=center, zoom_start=9)
+        st.success(f"Generated {len(polygons:=polys)} polygons")
 
-    folium.GeoJson(
-        fc,
-        style_function=lambda x:{
-            "fillColor":"#3388ff",
-            "color":"black",
-            "weight":1,
-            "fillOpacity":0.4
-        }
-    ).add_to(m)
+        # preview
+        st.components.v1.html(leaflet_html(polys), height=620)
 
-    return m
+        # ZIP export
+        buffer = tempfile.NamedTemporaryFile(delete=False)
+        with zipfile.ZipFile(buffer.name,"w") as z:
+            for i,p in enumerate(polys):
+                fc = {
+                    "type":"FeatureCollection",
+                    "features":[
+                        {"type":"Feature","properties":{},
+                         "geometry":mapping(p)}
+                    ]
+                }
+                z.writestr(f"area_{i+1}.geojson", json.dumps(fc))
 
-# ============================================================
-# RUN
-# ============================================================
-
-if run and uploaded:
-
-    try:
-        data=json.load(uploaded)
-
-        with st.spinner("Processing polygons..."):
-            result=process(data, target_km2)
-
-        st.success(f"Generated {len(result['features'])} polygons")
-
-        st.subheader("Preview")
-        m=show_map(result)
-        st_folium(m, width=900, height=500)
-
-        buf=BytesIO()
-        with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
-            z.writestr(
-                "area_blocks.geojson",
-                json.dumps(result)
+        with open(buffer.name,"rb") as f:
+            st.download_button(
+                "⬇️ Download ZIP",
+                f.read(),
+                file_name="split_5000km2.zip"
             )
-
-        st.download_button(
-            "⬇️ Download ZIP",
-            buf.getvalue(),
-            "hot_tm_blocks.zip",
-            "application/zip"
-        )
-
-    except Exception as e:
-        st.error(str(e))
-        st.text(traceback.format_exc())
