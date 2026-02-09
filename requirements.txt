@@ -1,3 +1,5 @@
 streamlit
 shapely
 lxml
+pyproj
+shapely>=2.0
